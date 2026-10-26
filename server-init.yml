@@ -1,0 +1,463 @@
+---
+# 适用于 Ubuntu 24.04 (noble)
+# 功能：
+#   1. 安装 Docker Engine 和 Docker Compose 插件
+#   2. 配置 rootless Docker（与 rootful 共存）
+#   3. 修改 SSH 端口
+- name: 服务器初始化：Docker 与 SSH
+  hosts: servers
+  become: true
+  # 不需要 setup 模块；Docker 和 SSH 任务都用显式命令/模块完成。
+  gather_facts: false
+
+  vars:
+    ssh_port: 12322
+
+    # rootless Docker 运行用户，必须是普通用户
+    docker_rootless_user: ubuntu
+
+    # Docker apt 源；国内默认清华，可换阿里云：
+    # https://mirrors.aliyun.com/docker-ce/linux/ubuntu
+    docker_apt_mirror: "https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/ubuntu"
+    docker_apt_suite: noble
+    docker_apt_keyring: /etc/apt/keyrings/docker.asc
+
+    # 拉镜像加速器，例如 ["https://xxxx.mirror.aliyuncs.com"]
+    docker_registry_mirrors: []
+
+    docker_packages:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+      - docker-ce-rootless-extras
+      - uidmap
+      - dbus-user-session
+      - slirp4netns
+      - fuse-overlayfs
+
+  tasks:
+    # ==================== Docker ====================
+    - name: 确保 python3-apt 已安装
+      ansible.builtin.raw: >-
+        dpkg -s python3-apt >/dev/null 2>&1 ||
+        (apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y python3-apt)
+      changed_when: false
+
+    - name: 确认 rootless 用户不是 root
+      ansible.builtin.assert:
+        that:
+          - docker_rootless_user != 'root'
+        fail_msg: "docker_rootless_user 必须是普通用户，不能是 root。"
+
+    - name: 读取 rootless 用户信息
+      ansible.builtin.getent:
+        database: passwd
+        key: "{{ docker_rootless_user }}"
+
+    - name: 记录 rootless 用户 uid 和 home
+      ansible.builtin.set_fact:
+        docker_rootless_uid: "{{ getent_passwd[docker_rootless_user][1] }}"
+        docker_rootless_home: "{{ getent_passwd[docker_rootless_user][4] }}"
+
+    - name: 安装 Docker apt 依赖
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+        state: present
+        update_cache: true
+
+    - name: 创建 apt keyrings 目录
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: 下载 Docker GPG key
+      ansible.builtin.get_url:
+        url: "{{ docker_apt_mirror }}/gpg"
+        dest: "{{ docker_apt_keyring }}"
+        mode: "0644"
+        force: false
+
+    - name: 配置 Docker apt 源
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/docker.sources
+        content: |
+          Types: deb
+          URIs: {{ docker_apt_mirror }}
+          Suites: {{ docker_apt_suite }}
+          Components: stable
+          Signed-By: {{ docker_apt_keyring }}
+        mode: "0644"
+
+    - name: 安装 Docker、Compose 插件和 rootless 依赖
+      ansible.builtin.apt:
+        name: "{{ docker_packages }}"
+        state: present
+        update_cache: true
+
+    - name: 创建 /etc/docker 目录
+      ansible.builtin.file:
+        path: /etc/docker
+        state: directory
+        mode: "0755"
+
+    - name: 配置 rootful Docker daemon
+      ansible.builtin.copy:
+        dest: /etc/docker/daemon.json
+        content: |
+          {
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "10m",
+              "max-file": "3"
+            },
+            "registry-mirrors": {{ docker_registry_mirrors | to_json }}
+          }
+        mode: "0644"
+      notify: 重启 Docker
+
+    - name: 启动 rootful Docker
+      ansible.builtin.systemd:
+        name: docker
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    # 不把普通用户加入 docker 组（等价于 root 权限）；rootful 用 sudo docker。
+    - name: 配置 rootless Docker 的 subuid/subgid
+      block:
+        - name: 检查 subuid
+          ansible.builtin.command:
+            cmd: getent subuid {{ docker_rootless_user }}
+          register: subuid
+          changed_when: false
+          failed_when: false
+
+        - name: 检查 subgid
+          ansible.builtin.command:
+            cmd: getent subgid {{ docker_rootless_user }}
+          register: subgid
+          changed_when: false
+          failed_when: false
+
+        - name: 添加 subuid
+          ansible.builtin.command:
+            cmd: usermod --add-subuids 100000-165535 {{ docker_rootless_user }}
+          when: subuid.stdout == ''
+
+        - name: 添加 subgid
+          ansible.builtin.command:
+            cmd: usermod --add-subgids 100000-165535 {{ docker_rootless_user }}
+          when: subgid.stdout == ''
+
+    - name: 检查 AppArmor 是否限制非特权 user namespace
+      ansible.builtin.slurp:
+        src: /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+      register: apparmor_userns
+      failed_when: false
+
+    - name: 为 rootlesskit 放行 user namespace
+      ansible.builtin.copy:
+        dest: /etc/apparmor.d/rootlesskit
+        content: |
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          profile rootlesskit /usr/bin/rootlesskit flags=(unconfined) {
+            userns,
+
+            include if exists <local/rootlesskit>
+          }
+        mode: "0644"
+      when:
+        - "apparmor_userns.content is defined"
+        - "(apparmor_userns.content | b64decode | trim) == '1'"
+      notify: 重载 AppArmor
+
+    # AppArmor profile 必须在 rootless 初始化之前生效。
+    - name: 应用 AppArmor 配置
+      ansible.builtin.meta: flush_handlers
+
+    - name: 检查 linger
+      ansible.builtin.command:
+        cmd: loginctl show-user {{ docker_rootless_user }} -p Linger
+      register: linger
+      changed_when: false
+      failed_when: false
+
+    - name: 启用 linger
+      ansible.builtin.command:
+        cmd: loginctl enable-linger {{ docker_rootless_user }}
+      when: "'Linger=yes' not in linger.stdout"
+
+    - name: 等待用户 systemd 启动
+      ansible.builtin.wait_for:
+        path: "/run/user/{{ docker_rootless_uid }}/bus"
+        timeout: 15
+
+    - name: 创建 rootless Docker 配置目录
+      ansible.builtin.file:
+        path: "{{ docker_rootless_home }}/.config/docker"
+        state: directory
+        owner: "{{ docker_rootless_user }}"
+        group: "{{ docker_rootless_user }}"
+        mode: "0700"
+
+    - name: 配置 rootless Docker daemon
+      ansible.builtin.copy:
+        dest: "{{ docker_rootless_home }}/.config/docker/daemon.json"
+        content: |
+          {
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "10m",
+              "max-file": "3"
+            },
+            "registry-mirrors": {{ docker_registry_mirrors | to_json }}
+          }
+        owner: "{{ docker_rootless_user }}"
+        group: "{{ docker_rootless_user }}"
+        mode: "0600"
+      notify: 重启 rootless Docker
+
+    - name: 检查 rootless Docker 是否已初始化
+      ansible.builtin.stat:
+        path: "{{ docker_rootless_home }}/.config/systemd/user/docker.service"
+      register: rootless_unit
+      become: true
+      become_user: "{{ docker_rootless_user }}"
+
+    - name: 初始化 rootless Docker
+      ansible.builtin.command:
+        cmd: /usr/bin/dockerd-rootless-setuptool.sh install
+      become: true
+      become_user: "{{ docker_rootless_user }}"
+      environment:
+        HOME: "{{ docker_rootless_home }}"
+        USER: "{{ docker_rootless_user }}"
+        LOGNAME: "{{ docker_rootless_user }}"
+        XDG_RUNTIME_DIR: "/run/user/{{ docker_rootless_uid }}"
+        DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ docker_rootless_uid }}/bus"
+        PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      when: not rootless_unit.stat.exists
+
+    - name: 启动 rootless Docker 用户服务
+      ansible.builtin.systemd:
+        name: docker
+        scope: user
+        enabled: true
+        state: started
+        daemon_reload: true
+      become: true
+      become_user: "{{ docker_rootless_user }}"
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ docker_rootless_uid }}"
+        DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ docker_rootless_uid }}/bus"
+
+    - name: 检查 rootless Docker context
+      ansible.builtin.command:
+        cmd: docker context inspect rootless
+      register: rootless_context
+      become: true
+      become_user: "{{ docker_rootless_user }}"
+      environment:
+        HOME: "{{ docker_rootless_home }}"
+      changed_when: false
+      failed_when: false
+
+    - name: 创建 rootless Docker context
+      ansible.builtin.command:
+        cmd: docker context create rootless --docker "host=unix:///run/user/{{ docker_rootless_uid }}/docker.sock"
+      become: true
+      become_user: "{{ docker_rootless_user }}"
+      environment:
+        HOME: "{{ docker_rootless_home }}"
+      when: rootless_context.rc != 0
+
+    - name: 设置 rootless Docker context
+      ansible.builtin.command:
+        cmd: docker context use rootless
+      become: true
+      become_user: "{{ docker_rootless_user }}"
+      environment:
+        HOME: "{{ docker_rootless_home }}"
+      changed_when: false
+
+    # 先应用 Docker 配置，避免和后面的 SSH 重启混在一起。
+    - name: 应用 Docker 配置
+      ansible.builtin.meta: flush_handlers
+
+    - name: 验证 rootful Docker
+      ansible.builtin.command:
+        cmd: "docker version --format '{{ '{{.Server.Version}}' }}'"
+      register: docker_rootful_version
+      changed_when: false
+      until: docker_rootful_version.rc == 0
+      retries: 10
+      delay: 2
+
+    - name: 验证 Docker Compose
+      ansible.builtin.command:
+        cmd: docker compose version
+      register: docker_compose_version
+      changed_when: false
+
+    - name: 验证 rootless Docker
+      ansible.builtin.command:
+        cmd: "docker version --format '{{ '{{.Server.Version}}' }}'"
+      register: docker_rootless_version
+      become: true
+      become_user: "{{ docker_rootless_user }}"
+      environment:
+        HOME: "{{ docker_rootless_home }}"
+        XDG_RUNTIME_DIR: "/run/user/{{ docker_rootless_uid }}"
+        DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ docker_rootless_uid }}/bus"
+      changed_when: false
+      until: docker_rootless_version.rc == 0
+      retries: 10
+      delay: 2
+
+    - name: 读取 rootless Docker context
+      ansible.builtin.command:
+        cmd: docker context show
+      register: docker_context
+      become: true
+      become_user: "{{ docker_rootless_user }}"
+      environment:
+        HOME: "{{ docker_rootless_home }}"
+        XDG_RUNTIME_DIR: "/run/user/{{ docker_rootless_uid }}"
+        DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ docker_rootless_uid }}/bus"
+      changed_when: false
+
+    - name: 确认 Docker 已就绪
+      ansible.builtin.assert:
+        that:
+          - "docker_rootful_version.stdout | trim | length > 0"
+          - "docker_compose_version.stdout is search('Docker Compose version')"
+          - "docker_rootless_version.stdout | trim | length > 0"
+          - "docker_context.stdout | trim == 'rootless'"
+        success_msg: "Docker rootful {{ docker_rootful_version.stdout | trim }} / rootless {{ docker_rootless_version.stdout | trim }} 已就绪"
+        fail_msg: "Docker 验证失败：rootful={{ docker_rootful_version.stdout | trim }} rootless={{ docker_rootless_version.stdout | trim }} context={{ docker_context.stdout | trim }}"
+
+    # ==================== SSH ====================
+    # service_facts 只返回 .service 单元，不包含 .socket。
+    # Ubuntu 24.04 默认由 ssh.socket 监听，所以这里直接问 systemd。
+    - name: 判断 SSH 是否由 ssh.socket 监听
+      ansible.builtin.command:
+        cmd: systemctl is-active --quiet ssh.socket
+      register: ssh_socket_state
+      changed_when: false
+      failed_when: false
+
+    - name: 记录判断结果
+      ansible.builtin.set_fact:
+        ssh_uses_socket: "{{ ssh_socket_state.rc == 0 }}"
+
+    - name: 创建 SSH 配置目录
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - /etc/ssh/sshd_config.d
+        - /etc/systemd/system/ssh.socket.d
+
+    - name: 修改主配置里的 Port
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^\s*Port\s+\d+'
+        line: "Port {{ ssh_port }}"
+        validate: "/usr/sbin/sshd -t -f %s"
+      notify: 重启或重载 SSH
+
+    - name: 写入 sshd 的 drop-in 配置
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/00-ansible-port.conf
+        content: |
+          # 由 Ansible 管理
+          Port {{ ssh_port }}
+        mode: "0644"
+      notify: 重启或重载 SSH
+
+    # Ubuntu 24.04 默认由 ssh.socket 负责监听，必须改 socket 的端口。
+    - name: socket 模式下修改监听端口
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/ssh.socket.d/port.conf
+        # 必须同时写 IPv4 和 IPv6：裸 ListenStream=端口 在
+        # BindIPv6Only=ipv6-only 的 ssh.socket 上只会监听 IPv6。
+        content: |
+          [Socket]
+          ListenStream=
+          ListenStream=0.0.0.0:{{ ssh_port }}
+          ListenStream=[::]:{{ ssh_port }}
+        mode: "0644"
+      when: ssh_uses_socket | bool
+      notify: 重启或重载 SSH
+
+    - name: 检查 SSH 配置语法
+      ansible.builtin.command:
+        cmd: /usr/sbin/sshd -t
+      changed_when: false
+
+    # 重启 ssh.socket 可能会短暂中断当前 SSH 连接；
+    # 执行时保留腾讯云 Web 控制台作为备用入口。
+    - name: 立即执行重启
+      ansible.builtin.meta: flush_handlers
+
+    - name: 读取实际监听端口
+      ansible.builtin.command:
+        cmd: ss -ltnp
+      register: ssh_listeners
+      changed_when: false
+      failed_when: false
+
+    - name: 确认新端口已监听
+      ansible.builtin.assert:
+        that:
+          - "(':' ~ ssh_port ~ ' ') in ssh_listeners.stdout"
+        fail_msg: "{{ ssh_port }} 没有在监听，请检查 ssh.socket：systemctl status ssh.socket"
+        success_msg: "SSH 已在 {{ ssh_port }} 端口监听"
+
+    - name: 提示下一步
+      ansible.builtin.debug:
+        msg:
+          - "Docker rootful 与 rootless 已配置完成。"
+          - "普通用户 docker 命令走 rootless；rootful 用 sudo docker。"
+          - "SSH 端口已改为 {{ ssh_port }}，先另开终端验证：ssh -p {{ ssh_port }} {{ inventory_hostname }}"
+          - "验证成功后，把 ~/.ssh/config 里对应 Host 的 Port 改成 {{ ssh_port }}。"
+
+  handlers:
+    - name: 重启 Docker
+      ansible.builtin.systemd:
+        name: docker
+        state: restarted
+        daemon_reload: true
+
+    - name: 重载 AppArmor
+      ansible.builtin.systemd:
+        name: apparmor
+        state: restarted
+
+    - name: 重启 rootless Docker
+      ansible.builtin.systemd:
+        name: docker
+        scope: user
+        state: restarted
+        daemon_reload: true
+      become: true
+      become_user: "{{ docker_rootless_user }}"
+      environment:
+        HOME: "{{ docker_rootless_home }}"
+        XDG_RUNTIME_DIR: "/run/user/{{ docker_rootless_uid }}"
+        DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ docker_rootless_uid }}/bus"
+
+    - name: 重启或重载 SSH
+      ansible.builtin.systemd:
+        name: "{{ 'ssh.socket' if ssh_uses_socket | bool else 'ssh' }}"
+        state: "{{ 'restarted' if ssh_uses_socket | bool else 'reloaded' }}"
+        daemon_reload: true

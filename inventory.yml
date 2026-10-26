@@ -1,0 +1,8 @@
+---
+# 只写 ~/.ssh/config 里的 Host 别名。
+# IP、用户、端口、私钥都由 SSH 配置管理，不要在 inventory 里重复写。
+all:
+  children:
+    servers:
+      hosts:
+        tc:
